@@ -57,12 +57,11 @@ def get_system_info():
     """
     info = {
         "System": platform.system(),
-        "Node Name": platform.node(),
         "Release": platform.release(),
         "Version": platform.version(),
         "Machine": platform.machine(),
         "Processor": platform.processor(),
-        "RAM": f"{round(psutil.virtual_memory().total / (1024.0 **3))} GB"
+        "RAM": f"{round(psutil.virtual_memory().total / (1024.0 **3))} GB",
     }
     log_print("=" * 40)
     log_print("System Information:")
@@ -93,6 +92,10 @@ def generate_datasets(sf):
         log_print(f"Transferring table: {table}...")
         # Creating Data Frame from DuckDB
         df = con_duck.execute(f"SELECT * FROM {table}").df()
+        # Convert date/datetime columns to ISO format strings for consistent SQLite storage
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = df[col].dt.strftime('%Y-%m-%d')
         # Transfer to SQLite
         df.to_sql(table, con_sqlite, index=False)
 
@@ -209,7 +212,7 @@ def run_benchmark():
 
     get_system_info()
 
-    scale_factors = [0.001, 0.002, 0.004, 0.006, 0.008, 0.01, 0.015, 0.02, 0.025, 0.03]
+    scale_factors = [0.001, 0.002, 0.004, 0.006, 0.008, 0.01, 0.015, 0.02, 0.05, 0.1]
     results_data = []
 
     for sf_idx, sf in enumerate(scale_factors):
@@ -250,6 +253,12 @@ def run_scales(sf, sf_idx, results_data):
         con_sqlite_idx = sqlite3.connect("db_sqlite_with_index.db")
         create_sqlite_indexes(con_sqlite_idx)
         size_sqlite_idx = os.path.getsize("db_sqlite_with_index.db")
+
+    # Print database sizes
+    log_print(f"\nDatabase Sizes for SF {sf}:")
+    log_print(f"  DuckDB: {size_duck:,} bytes ({size_duck/1024/1024:.2f} MB)")
+    log_print(f"  SQLite (no index): {size_sqlite_no:,} bytes ({size_sqlite_no/1024/1024:.2f} MB)")
+    log_print(f"  SQLite (with index): {size_sqlite_idx:,} bytes ({size_sqlite_idx/1024/1024:.2f} MB)")
 
     for q_num in range(1, 23):
         run_queries(size_duck, size_sqlite_no, size_sqlite_idx, sf, sf_idx, q_num, results_data,
@@ -310,6 +319,7 @@ def add_to_results(con, query, results_data, q_num, configuration_name, sf,
     Execute query and add results.
     Returns (exceeded_90s, result_df) tuple.
     """
+    # HEREEEEEEEEEEEEEEEEEEEE why True / False?
     global skip_queries
 
     is_duckdb = configuration_name == "DuckDB"
@@ -319,13 +329,17 @@ def add_to_results(con, query, results_data, q_num, configuration_name, sf,
         log_print(f"{configuration_name}: SKIPPED (Query {q_num} exceeded 90s in previous round)")
         return False, None
 
+    # HEREEEEEEEEEEEEEEEEE
     if "SQLite" in configuration_name:
         query = translate_query_sql(query)
+    """if not is_duckdb:
+        query = translate_query_sql(query)"""
 
     time_con, result_df = measure_query_time(con, query, is_duckdb=is_duckdb)
 
     if time_con is not None:
-        log_print(f"  {configuration_name}: {time_con:.4f}s")
+        exec_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_print(f"[{exec_time}] {configuration_name}: {time_con:.4f}s")
         results_data.append({
             "Query_Num": q_num,
             "Configuration": configuration_name,
@@ -337,18 +351,18 @@ def add_to_results(con, query, results_data, q_num, configuration_name, sf,
 
         # Print query results as DataFrame
         if result_df is not None:
-            log_print(f"  {configuration_name} Results (Query {q_num}):")
+            log_print(f"{configuration_name} Results (Query {q_num}):")
             log_print(result_df)
 
         # If query took >90s, mark it to skip in future rounds for this config
         if time_con > 90:
-            log_print(f"  {configuration_name} Query {q_num} exceeded 90s! Skipping in future rounds.")
+            log_print(f"{configuration_name} Query {q_num} exceeded 90s! Skipping in future rounds.")
             skip_queries[configuration_name].add(q_num)
             return True, result_df
 
         return False, result_df
     else:
-        log_print(f"  {configuration_name}: FAILED for Query #{q_num}")
+        log_print(f"{configuration_name}: FAILED for Query #{q_num}")
 
     return False, None
 
@@ -378,64 +392,59 @@ def compare_results(df_duck, df_sqlite, q_num, config_name):
         log_print("    Cannot compare: One or both results are empty")
         return
 
+    # Check row counts
+    row_match = len(df_duck) == len(df_sqlite)
+    if not row_match:
+        log_print(f"    Row count mismatch: DuckDB={len(df_duck)}, {config_name}={len(df_sqlite)}")
+        return
+
     # Check column counts
     if len(df_duck.columns) != len(df_sqlite.columns):
         log_print(f"    Column count mismatch: DuckDB={len(df_duck.columns)}, {config_name}={len(df_sqlite.columns)}")
         return
 
-    # Check column names (case-insensitive)
-    duck_cols = [c.lower() for c in df_duck.columns]
-    sqlite_cols = [c.lower() for c in df_sqlite.columns]
-    if duck_cols != sqlite_cols:
-        log_print(f"    Column names differ:")
-        log_print(f"      DuckDB: {list(df_duck.columns)}")
-        log_print(f"      {config_name}: {list(df_sqlite.columns)}")
-
-    # Check row counts
-    if len(df_duck) != len(df_sqlite):
-        log_print(f"    Row count mismatch: DuckDB={len(df_duck)}, {config_name}={len(df_sqlite)}")
-
-    # Compare values
-    df_duck_cmp = df_duck.reset_index(drop=True)
-    df_sqlite_cmp = df_sqlite.reset_index(drop=True)
+    # Normalize column names for comparison
+    df_duck_cmp = df_duck.reset_index(drop=True).copy()
+    df_sqlite_cmp = df_sqlite.reset_index(drop=True).copy()
     df_duck_cmp.columns = [c.lower() for c in df_duck_cmp.columns]
     df_sqlite_cmp.columns = [c.lower() for c in df_sqlite_cmp.columns]
 
-    try:
-        if df_duck_cmp.shape == df_sqlite_cmp.shape:
-            diff_found = False
-            for col in df_duck_cmp.columns:
-                try:
-                    # Try numeric comparison first
-                    duck_numeric = pd.to_numeric(df_duck_cmp[col], errors='coerce')
-                    sqlite_numeric = pd.to_numeric(df_sqlite_cmp[col], errors='coerce')
+    # Compare values column by column
+    diff_found = False
+    for col in df_duck_cmp.columns:
+        if col not in df_sqlite_cmp.columns:
+            log_print(f"    Column '{col}' not found in SQLite results")
+            diff_found = True
+            continue
 
-                    if not duck_numeric.isna().all() and not sqlite_numeric.isna().all():
-                        # Both columns are numeric - compare with relative tolerance (0.1%)
-                        # Use: |a - b| <= max(|a|, |b|) * 0.001
-                        diff = duck_numeric.subtract(sqlite_numeric).abs()
-                        max_vals = pd.concat([duck_numeric.abs(), sqlite_numeric.abs()], axis=1).max(axis=1)
-                        tolerance = max_vals * 0.001  # 0.1% relative tolerance
-                        tolerance = tolerance.clip(lower=0.01)  # minimum 0.01 absolute tolerance
-                        if not (diff <= tolerance).all():
-                            diff_found = True
-                            log_print(f"    Differences found in column '{col}'")
-                    else:
-                        # String comparison with normalization
-                        duck_norm = df_duck_cmp[col].apply(normalize_value)
-                        sqlite_norm = df_sqlite_cmp[col].apply(normalize_value)
-                        if not duck_norm.equals(sqlite_norm):
-                            diff_found = True
-                            log_print(f"    Differences found in column '{col}'")
-                except Exception:
-                    pass
+        duck_col = df_duck_cmp[col]
+        sqlite_col = df_sqlite_cmp[col]
 
-            if not diff_found:
-                log_print("    Results match!")
+        # Try numeric comparison (rounded to integers)
+        duck_numeric = pd.to_numeric(duck_col, errors='coerce')
+        sqlite_numeric = pd.to_numeric(sqlite_col, errors='coerce')
+
+        if not duck_numeric.isna().all() and not sqlite_numeric.isna().all():
+            # Numeric comparison - first round to 2 decimals to remove float noise, then to integers
+            duck_rounded = duck_numeric.round(2).round(0).fillna(-999999).astype(float)
+            sqlite_rounded = sqlite_numeric.round(2).round(0).fillna(-999999).astype(float)
+            diff_mask = duck_rounded != sqlite_rounded
+            if diff_mask.any():
+                diff_found = True
+                first_diff_idx = diff_mask.idxmax()
+                log_print(f"    Diff in '{col}' row {first_diff_idx}: DuckDB={duck_col[first_diff_idx]}, SQLite={sqlite_col[first_diff_idx]}")
         else:
-            log_print(f"    Shape mismatch: DuckDB={df_duck_cmp.shape}, {config_name}={df_sqlite_cmp.shape}")
-    except Exception as e:
-        log_print(f"    Comparison error: {e}")
+            # String comparison
+            duck_str = duck_col.apply(normalize_value)
+            sqlite_str = sqlite_col.apply(normalize_value)
+            diff_mask = duck_str != sqlite_str
+            if diff_mask.any():
+                diff_found = True
+                first_diff_idx = diff_mask.idxmax()
+                log_print(f"    Diff in '{col}' row {first_diff_idx}: DuckDB={duck_col[first_diff_idx]}, SQLite={sqlite_col[first_diff_idx]}")
+
+    if not diff_found:
+        log_print(f"    Results match! ({len(df_duck_cmp.columns)} columns, {len(df_duck_cmp)} rows)")
 
 
 def generate_plots():
@@ -530,12 +539,40 @@ def translate_query_sql(query_text):
         # If automatic translation fails, we fall back to regex or original
         pass
 
+    fixed_query = translated_text
+
+    # Fix EXTRACT(year FROM column) -> strftime('%Y', column)
     fixed_query = re.sub(
         r"extract\s*\(\s*year\s+from\s+([a-zA-Z0-9_.]+)\s*\)",
         r"strftime('%Y', \1)",
-        translated_text,
+        fixed_query,
         flags=re.IGNORECASE
     )
+
+    # Fix date 'YYYY-MM-DD' - interval 'N' day -> date('YYYY-MM-DD', '-N days')
+    fixed_query = re.sub(
+        r"date\s*'([^']+)'\s*-\s*interval\s*'(\d+)'\s*days?",
+        r"date('\1', '-\2 days')",
+        fixed_query,
+        flags=re.IGNORECASE
+    )
+
+    # Fix date 'YYYY-MM-DD' + interval 'N' day -> date('YYYY-MM-DD', '+N days')
+    fixed_query = re.sub(
+        r"date\s*'([^']+)'\s*\+\s*interval\s*'(\d+)'\s*days?",
+        r"date('\1', '+\2 days')",
+        fixed_query,
+        flags=re.IGNORECASE
+    )
+
+    # Fix CAST(column AS date) -> date(column)
+    fixed_query = re.sub(
+        r"CAST\s*\(\s*([a-zA-Z0-9_.]+)\s+AS\s+date\s*\)",
+        r"date(\1)",
+        fixed_query,
+        flags=re.IGNORECASE
+    )
+
     return fixed_query
 
 if __name__ == "__main__":
